@@ -1,0 +1,14 @@
+[project]
+name = "point-cloud-labeller"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10.12"
+dependencies = [
+    "matplotlib>=3.10.0",
+    "numpy>=2.2.1",
+    "opencv-python>=4.10.0.84",
+    "pillow>=11.1.0",
+    "torch>=2.5.1",
+    "transformers>=4.47.1",
+]
