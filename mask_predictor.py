@@ -12,7 +12,7 @@ from typing import Tuple, Dict
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def show_mask(mask):
+def show_mask(image, mask):
     masked_regions = mask > 0
     mask_array = np.ma.masked_where(~masked_regions, mask)
     plt.figure(figsize=(10, 10))
@@ -118,10 +118,12 @@ class MaskPredictor:
         )
         max_conf_idx = iou_predictions.argmax(dim=1)
         all_masks = all_masks[torch.arange(all_masks.shape[0]), max_conf_idx]
+        id_mask_mapping = dict()
         for mask_index, mask in enumerate(all_masks):
-            label_id = label_id_mapping[labels[mask_index]]
-            final_mask[mask] = label_id
-        return final_mask.numpy(), id_label_mapping
+            # label_id = label_id_mapping[labels[mask_index]]
+            final_mask[mask] = mask_index + 1  # 0 for background
+            id_mask_mapping[mask_index + 1] = labels[mask_index]
+        return final_mask.numpy(), id_mask_mapping
 
 
 if __name__ == "__main__":
@@ -129,4 +131,4 @@ if __name__ == "__main__":
     image = Image.open("images/kitti_1.png").convert("RGB")
     text = "car.pole."
     mask, id_label_mapping = predictor.inference(image, text)
-    show_mask(mask)
+    show_mask(image, mask)

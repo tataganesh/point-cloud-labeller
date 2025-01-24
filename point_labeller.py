@@ -30,7 +30,7 @@ def draw_points(image, image_coordinates, color_indices):
 
 basedir = "/Volumes/Expansion/KITTI_datasets/KITTI_Raw/raw_data_downloader"
 date = "2011_09_26"
-drive = "0005"
+drive = "0009"
 
 # The 'frames' argument is optional - default: None, which loads the whole dataset.
 # Calibration, timestamps, and IMU data are read automatically.
@@ -51,6 +51,13 @@ cmap = np.array([cmap(i) for i in range(256)])[:, :3] * 255
 
 ## Init predictor
 predictor = MaskPredictor()
+
+
+def get_outlier_mask(data, m=2.0):
+    d = np.abs(data - np.median(data))
+    mdev = np.median(d)
+    s = d / mdev if mdev else np.zeros(len(d))
+    return s < m
 
 
 for idx in range(0, 100, 10):
@@ -102,18 +109,32 @@ for idx in range(0, 100, 10):
         valid_image_indices
     )
 
-    text = "car."
+    text = "car.person.tree trunk."
     mask, id_label_mapping = predictor.inference(cam2_image_pil, text)
     # show_mask(cam2_image_pil, mask)
 
-    label_corresponding_point_idx = image_to_point_index_map[mask == 1]
-    label_corresponding_point_idx = label_corresponding_point_idx[
-        label_corresponding_point_idx != -1
-    ]  # Remove all pixels for which points are NOT available
+    point_mask = np.zeros(points.shape[0], dtype=bool)
+    for mask_id, label in id_label_mapping.items():
+        label_corresponding_point_idx = image_to_point_index_map[mask == mask_id]
+        label_corresponding_point_idx = label_corresponding_point_idx[
+            label_corresponding_point_idx != -1
+        ]  # Remove all pixels for which points are NOT available
+        object_points = points[label_corresponding_point_idx]
+        object_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(object_points))
+        cluster_ids = object_pcd.cluster_dbscan(eps=1.0, min_points=5)
+        cluster_ids = np.asarray(cluster_ids)
+        filtered_cluster_ids = cluster_ids[cluster_ids != -1]
+        if filtered_cluster_ids.size:
+            counts = np.bincount(filtered_cluster_ids)
+            largest_cluster_ID = np.argmax(counts)
+            label_corresponding_point_idx = label_corresponding_point_idx[
+                cluster_ids == largest_cluster_ID
+            ]
+        point_mask[label_corresponding_point_idx] = True
 
     # cam2_image = draw_points(cam2_image, image_coordinates, color_indices)
     point_colors = np.full_like(points, (0, 0.1, 0.4))
-    point_colors[label_corresponding_point_idx] = (1, 0, 0)
+    point_colors[point_mask] = (1, 0, 0)
     # point_colors[random_idx] = POINT_IMAGE_COLOR
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(point_colors)
@@ -136,4 +157,3 @@ for idx in range(0, 100, 10):
     vis.update_geometry(pcd)
     vis.poll_events()
     vis.update_renderer()
-    # input()
