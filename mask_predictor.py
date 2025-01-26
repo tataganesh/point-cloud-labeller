@@ -13,7 +13,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def show_mask(image, mask):
-    masked_regions = mask > 0
+    masked_regions = mask >= 0  # Assume -1 to be background
     mask_array = np.ma.masked_where(~masked_regions, mask)
     plt.figure(figsize=(10, 10))
     plt.imshow(image)
@@ -103,13 +103,12 @@ class MaskPredictor:
             and M[i,j] is the class label
             dict: Label ID to label name mapping
         """
-        final_mask = torch.zeros(image.size[::-1], dtype=torch.int32)
+        final_mask = torch.full(image.size[::-1], fill_value=-1, dtype=torch.int32)
         bounding_boxes, labels = self.__get_bounding_boxes(image, text_prompt)
+        print(bounding_boxes, labels)
         if not bounding_boxes.shape[0]:
-            return final_mask.numpy(), {}
-        label_id_mapping = {
-            label: idx for idx, label in enumerate(set(labels), start=1)
-        }
+            return final_mask.numpy(), {}, np.array([])
+        label_id_mapping = {label: idx for idx, label in enumerate(set(labels))}
         id_label_mapping = {idx: label for label, idx in label_id_mapping.items()}
         ## SAM inference
         np_image = np.asarray(image)
@@ -121,9 +120,9 @@ class MaskPredictor:
         id_mask_mapping = dict()
         for mask_index, mask in enumerate(all_masks):
             # label_id = label_id_mapping[labels[mask_index]]
-            final_mask[mask] = mask_index + 1  # 0 for background
-            id_mask_mapping[mask_index + 1] = labels[mask_index]
-        return final_mask.numpy(), id_mask_mapping
+            final_mask[mask] = mask_index
+            id_mask_mapping[mask_index] = labels[mask_index]
+        return final_mask.numpy(), id_mask_mapping, bounding_boxes
 
 
 if __name__ == "__main__":

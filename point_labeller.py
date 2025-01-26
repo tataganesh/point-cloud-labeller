@@ -3,75 +3,76 @@ import numpy as np
 import cv2
 import open3d as o3d
 import matplotlib.pyplot as plt
-import time
 from mask_predictor import MaskPredictor, show_mask
-
-cmap = plt.cm.jet
-
-
-def scalars_to_colors(scalars):
-    N = 256
-    bins = np.linspace(scalars.min(), scalars.max(), N + 1)
-    dig = np.digitize(scalars, bins) - 1
-    dig[dig == N] = N - 1  # map the last half-open interval back
-    norm = plt.Normalize(scalars.min(), scalars.max())
-    colors = cmap(norm(scalars))
-    return colors
-
-
-def draw_points(image, image_coordinates, color_indices):
-    for i, (u, v, z) in enumerate(image_coordinates):
-        color = cmap[color_indices[i], :]
-        u = int(u)
-        v = int(v)
-        cv2.circle(image, (u, v), 2, tuple(color), -1)
-    return image
-
-
-basedir = "/Volumes/Expansion/KITTI_datasets/KITTI_Raw/raw_data_downloader"
-date = "2011_09_26"
-drive = "0009"
-
-# The 'frames' argument is optional - default: None, which loads the whole dataset.
-# Calibration, timestamps, and IMU data are read automatically.
-# Camera and velodyne data are available via properties that create generators
-# when accessed, or through getter methods that provide random access.
-data = pykitti.raw(basedir, date, drive)
-
-point_velo = np.array([0, 0, 0, 1])
-point_cam0 = data.calib.T_cam2_velo.dot(point_velo)
 
 vis = o3d.visualization.Visualizer()
 vis.create_window()
 pcd = o3d.geometry.PointCloud()
 
 
-cmap = plt.cm.get_cmap("hsv", 256)
-cmap = np.array([cmap(i) for i in range(256)])[:, :3] * 255
+def draw_bboxes(image: np.ndarray, bboxes: np.ndarray) -> np.ndarray:
+    for box in bboxes:
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 1)
+    return image
+
+
+def get_points_corresponding_to_mask(
+    lidar_points, id_label_mapping, image_to_point_index_map, segmentation_mask
+):
+    point_labels = np.full(lidar_points.shape[0], fill_value=-1)
+    object_boxes = list()
+    for label_id, _ in id_label_mapping.items():
+        label_corresponding_point_idx = image_to_point_index_map[
+            segmentation_mask == label_id
+        ]
+        label_corresponding_point_idx = label_corresponding_point_idx[
+            label_corresponding_point_idx != -1
+        ]  # Remove indices where pixel coordinates do NOT have a corresponding point
+
+        ## Cluster object points and label points in largest cluster
+        object_points = lidar_points[label_corresponding_point_idx]
+        object_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(object_points))
+        object_pcd, outlier_indices = object_pcd.remove_statistical_outlier(
+            nb_neighbors=20, std_ratio=0.5
+        )
+        outlier_indices = np.array(outlier_indices)
+        cluster_ids = object_pcd.cluster_dbscan(eps=1.0, min_points=10)
+        cluster_ids = np.asarray(cluster_ids)
+        filtered_cluster_ids = cluster_ids[
+            cluster_ids != -1
+        ]  # Remove points marked as outliers
+        if filtered_cluster_ids.size:
+            counts = np.bincount(filtered_cluster_ids)
+            largest_cluster_ID = np.argmax(counts)
+            label_corresponding_point_idx = label_corresponding_point_idx[
+                outlier_indices[cluster_ids == largest_cluster_ID]
+            ]
+            point_labels[label_corresponding_point_idx] = label_id
+
+            ## Create 3D bbox
+            object_boxes_3d = (
+                o3d.geometry.OrientedBoundingBox.create_from_points_minimal(
+                    o3d.utility.Vector3dVector(
+                        lidar_points[label_corresponding_point_idx]
+                    )
+                )
+            )
+            object_boxes_3d.color = [0, 1, 0]
+            object_boxes.append(object_boxes_3d)
+            print(np.asarray(object_boxes_3d.get_box_points()))
+
+    return point_labels, object_boxes
+
 
 ## Init predictor
 predictor = MaskPredictor()
 
 
-def get_outlier_mask(data, m=2.0):
-    d = np.abs(data - np.median(data))
-    mdev = np.median(d)
-    s = d / mdev if mdev else np.zeros(len(d))
-    return s < m
-
-
-for idx in range(0, 100, 10):
-    cam2_image_pil, cam3_image = data.get_rgb(idx)
-    cam2_image = np.asarray(cam2_image_pil).copy()
-    image_height, image_width = cam2_image.shape[:2]
-
-    ## Calculate velo -> cam2-image-coordinates (homogenous)
-    p_cam2 = np.zeros((3, 4))
-    p_cam2[:3, :3] = data.calib.K_cam2
-    T_cam2img_velo = np.matmul(p_cam2, data.calib.T_cam2_velo)
-    points = data.get_velo(idx)[:, :3]  ## Points in lidar frame
+def label_points(image, lidar_points, text_prompt, T_IMAGE_LIDAR):
+    image_width, image_height = image.size
     image_coordinates_homogenous = np.matmul(
-        T_cam2img_velo, np.c_[points, np.ones(points.shape[0])].T
+        T_IMAGE_LIDAR, np.c_[lidar_points, np.ones(lidar_points.shape[0])].T
     ).T
 
     ## Homogenous to cartesian image coordinates (pixels)
@@ -81,7 +82,7 @@ for idx in range(0, 100, 10):
         image_coordinates_homogenous[:, :2] / z_camera_frame[:, None]
     )
 
-    ## 1. Mask negative image coordinate frame depth values
+    ## 1. Mask points behind image
     ## 2. Mask out-of-bounds image coordinates
     valid_image_indices = np.where(
         (z_camera_frame > 0)
@@ -92,16 +93,7 @@ for idx in range(0, 100, 10):
             image_coordinates[:, 1] > 0, image_coordinates[:, 1] < image_height
         )
     )[0]
-    image_coordinates = image_coordinates[valid_image_indices]
-    color_indices = (
-        (image_coordinates[:, 2] - z_camera_frame.min())
-        / (z_camera_frame.max() - z_camera_frame.min())
-        * 255
-    ).astype(int)
-
-    lidar_point_correspondences = points[valid_image_indices]
-    image_coordinates = image_coordinates.astype(int)
-    # rgb_values = cam2_image[image_coordinates[:, 1], image_coordinates[:, 0]]
+    image_coordinates = image_coordinates[valid_image_indices].astype(int)
     image_to_point_index_map = np.full(
         (image_height, image_width), fill_value=-1, dtype=int
     )
@@ -109,51 +101,87 @@ for idx in range(0, 100, 10):
         valid_image_indices
     )
 
-    text = "car.person.tree trunk."
-    mask, id_label_mapping = predictor.inference(cam2_image_pil, text)
-    # show_mask(cam2_image_pil, mask)
+    ## Get segmention mask
+    segmentation_mask, id_label_mapping, bounding_boxes = predictor.inference(
+        image, text_prompt
+    )
+    print(id_label_mapping, bounding_boxes)
 
-    point_mask = np.zeros(points.shape[0], dtype=bool)
-    for mask_id, label in id_label_mapping.items():
-        label_corresponding_point_idx = image_to_point_index_map[mask == mask_id]
-        label_corresponding_point_idx = label_corresponding_point_idx[
-            label_corresponding_point_idx != -1
-        ]  # Remove all pixels for which points are NOT available
-        object_points = points[label_corresponding_point_idx]
-        object_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(object_points))
-        cluster_ids = object_pcd.cluster_dbscan(eps=1.0, min_points=5)
-        cluster_ids = np.asarray(cluster_ids)
-        filtered_cluster_ids = cluster_ids[cluster_ids != -1]
-        if filtered_cluster_ids.size:
-            counts = np.bincount(filtered_cluster_ids)
-            largest_cluster_ID = np.argmax(counts)
-            label_corresponding_point_idx = label_corresponding_point_idx[
-                cluster_ids == largest_cluster_ID
-            ]
-        point_mask[label_corresponding_point_idx] = True
-
-    # cam2_image = draw_points(cam2_image, image_coordinates, color_indices)
-    point_colors = np.full_like(points, (0, 0.1, 0.4))
-    point_colors[point_mask] = (1, 0, 0)
-    # point_colors[random_idx] = POINT_IMAGE_COLOR
-    pcd.points = o3d.utility.Vector3dVector(points)
+    ## Get
+    point_labels, object_boxes = get_points_corresponding_to_mask(
+        lidar_points, id_label_mapping, image_to_point_index_map, segmentation_mask
+    )
+    point_colors = np.full_like(lidar_points, (0.5, 0.5, 0.5))
+    for label_id, _ in id_label_mapping.items():
+        point_colors[point_labels == label_id] = (1, 0, 0)
+    # lidar_points[:, 2] = 0
+    pcd.points = o3d.utility.Vector3dVector(lidar_points)
     pcd.colors = o3d.utility.Vector3dVector(point_colors)
-    cv2.imshow("window", cam2_image)
-    # o3d.visualization.draw_geometries([pcd])
+    image_with_bboxes = draw_bboxes(
+        cv2.cvtColor(np.asarray(image).copy(), cv2.COLOR_BGR2RGB), bounding_boxes
+    )
+    return image_with_bboxes, pcd, object_boxes
 
-    # print(parameters.intrinsic)
+    # if idx == 0:
+    #     vis.add_geometry(pcd)
+    # ctr.set_zoom(0.3)
+    # vis.update_geometry(pcd)
+    # vis.poll_events()
+    # vis.update_renderer()
+
+
+### KITTI Constants
+
+KITTI_RAW_DATA_BASEDIR = (
+    "/Volumes/Expansion/KITTI_datasets/KITTI_Raw/raw_data_downloader"
+)
+DATE = "2011_09_26"
+drive = "0015"
+pykitti_data = pykitti.raw(KITTI_RAW_DATA_BASEDIR, DATE, drive)
+
+
+## Calculate transformation matrix from 3D velodyne points to 2D Cam2 image coordinates
+p_cam2 = np.zeros((3, 4))
+p_cam2[:3, :3] = pykitti_data.calib.K_cam2
+T_cam2img_velo = np.matmul(p_cam2, pykitti_data.calib.T_cam2_velo)
+
+
+## Input KITTI sequence (Preferably an ID)
+## Output - Visualized and segmented point cloud.
+
+
+text_prompt = "person.cars.street pole."
+for idx in range(0, 100, 10):
+    cam2_image_pil, cam3_image = pykitti_data.get_rgb(idx)
+    lidar_points = pykitti_data.get_velo(idx)[:, :3]  ## Points in lidar frame
+    print(pykitti_data.get_velo(idx).shape)
+    image_with_boxes, point_cloud, object_boxes = label_points(
+        cam2_image_pil, lidar_points, text_prompt, T_cam2img_velo
+    )
+    cv2.imshow("window", image_with_boxes)
+    # o3d.visualization.draw_geometries([pcd, *object_boxes])
+    vis.create_window()
+
+    # Call only after creating visualizer window.
+    vis.get_render_option().background_color = [0, 0, 0]
+    # if idx == 0:
+    #     vis.add_geometry(pcd)
+    vis.add_geometry(pcd)
+    for box in object_boxes:
+        vis.add_geometry(box)
+
     ctr = vis.get_view_control()
+
     parameters = o3d.camera.PinholeCameraParameters()
     parameters.intrinsic = o3d.camera.PinholeCameraIntrinsic(
-        image_width, image_height, data.calib.K_cam2
+        image_with_boxes.shape[1], image_with_boxes.shape[0], pykitti_data.calib.K_cam2
     )  # p_cam2
-    parameters.extrinsic = data.calib.T_cam2_velo
+    parameters.extrinsic = pykitti_data.calib.T_cam2_velo
     ctr.convert_from_pinhole_camera_parameters(parameters, True)
-    # # # ctr.set_up([-0.0694, -0.9768, 0.2024])
-    # # ctr.set_zoom(0.5)
-    if idx == 0:
-        vis.add_geometry(pcd)
 
-    vis.update_geometry(pcd)
     vis.poll_events()
     vis.update_renderer()
+
+    if not vis.poll_events():
+        break
+    vis.clear_geometries()
