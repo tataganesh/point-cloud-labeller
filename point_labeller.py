@@ -4,10 +4,50 @@ import cv2
 import open3d as o3d
 import matplotlib.pyplot as plt
 from mask_predictor import MaskPredictor, show_mask
+from utils.bev import point_cloud_2_birdseye
+from PIL import Image
 
 vis = o3d.visualization.Visualizer()
 vis.create_window()
 pcd = o3d.geometry.PointCloud()
+
+
+def color_point_cloud_by_depth(points, colormap="jet"):
+    """
+    Colors a point cloud based on the z-coordinates (depth) of points.
+
+    Parameters:
+        pcd (open3d.geometry.PointCloud): Input point cloud
+        colormap (str): Type of colormap ('jet' or 'rainbow')
+
+    Returns:
+        open3d.geometry.PointCloud: Colored point cloud
+    """
+    # Extract z-coordinates
+    z_values = points[:, 2]
+
+    # Normalize depth values to [0, 1]
+    z_min, z_max = np.min(z_values), np.max(z_values)
+    z_normalized = (z_values - z_min) / (z_max - z_min)
+
+    # Initialize colors array
+    colors = np.zeros((len(points), 3))
+
+    if colormap == "jet":
+        # Jet colormap (blue -> cyan -> yellow -> red)
+        colors[:, 0] = np.clip(1.5 - 4 * abs(z_normalized - 0.5), 0, 1)  # Red
+        colors[:, 1] = np.clip(1.5 - 4 * abs(z_normalized - 0.25), 0, 1)  # Green
+        colors[:, 2] = np.clip(1.5 - 4 * abs(z_normalized - 0.75), 0, 1)  # Blue
+
+    elif colormap == "rainbow":
+        # Rainbow colormap
+        colors[:, 0] = np.abs(np.sin(2 * np.pi * z_normalized))  # Red
+        colors[:, 1] = np.abs(np.sin(2 * np.pi * (z_normalized + 1 / 3)))  # Green
+        colors[:, 2] = np.abs(np.sin(2 * np.pi * (z_normalized + 2 / 3)))  # Blue
+
+    colors *= 0.2
+    # Assign colors to point cloud
+    return colors
 
 
 def draw_bboxes(image: np.ndarray, bboxes: np.ndarray) -> np.ndarray:
@@ -18,7 +58,11 @@ def draw_bboxes(image: np.ndarray, bboxes: np.ndarray) -> np.ndarray:
 
 
 def get_points_corresponding_to_mask(
-    lidar_points, id_label_mapping, image_to_point_index_map, segmentation_mask
+    lidar_points,
+    id_label_mapping,
+    image_to_point_index_map,
+    segmentation_mask,
+    image_coordinates,
 ):
     point_labels = np.full(lidar_points.shape[0], fill_value=-1)
     object_boxes = list()
@@ -29,7 +73,6 @@ def get_points_corresponding_to_mask(
         label_corresponding_point_idx = label_corresponding_point_idx[
             label_corresponding_point_idx != -1
         ]  # Remove indices where pixel coordinates do NOT have a corresponding point
-
         ## Cluster object points and label points in largest cluster
         object_points = lidar_points[label_corresponding_point_idx]
         object_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(object_points))
@@ -61,7 +104,6 @@ def get_points_corresponding_to_mask(
             object_boxes_3d.color = [0, 1, 0]
             object_boxes.append(object_boxes_3d)
             print(np.asarray(object_boxes_3d.get_box_points()))
-
     return point_labels, object_boxes
 
 
@@ -93,13 +135,13 @@ def label_points(image, lidar_points, text_prompt, T_IMAGE_LIDAR):
             image_coordinates[:, 1] > 0, image_coordinates[:, 1] < image_height
         )
     )[0]
-    image_coordinates = image_coordinates[valid_image_indices].astype(int)
+    valid_image_coordinates = image_coordinates[valid_image_indices].astype(int)
     image_to_point_index_map = np.full(
         (image_height, image_width), fill_value=-1, dtype=int
     )
-    image_to_point_index_map[image_coordinates[:, 1], image_coordinates[:, 0]] = (
-        valid_image_indices
-    )
+    image_to_point_index_map[
+        valid_image_coordinates[:, 1], valid_image_coordinates[:, 0]
+    ] = valid_image_indices
 
     ## Get segmention mask
     segmentation_mask, id_label_mapping, bounding_boxes = predictor.inference(
@@ -109,9 +151,13 @@ def label_points(image, lidar_points, text_prompt, T_IMAGE_LIDAR):
 
     ## Get
     point_labels, object_boxes = get_points_corresponding_to_mask(
-        lidar_points, id_label_mapping, image_to_point_index_map, segmentation_mask
+        lidar_points,
+        id_label_mapping,
+        image_to_point_index_map,
+        segmentation_mask,
+        image_coordinates[:, :2].astype(int),
     )
-    point_colors = np.full_like(lidar_points, (0.5, 0.5, 0.5))
+    point_colors = color_point_cloud_by_depth(lidar_points)
     for label_id, _ in id_label_mapping.items():
         point_colors[point_labels == label_id] = (1, 0, 0)
     # lidar_points[:, 2] = 0
@@ -136,7 +182,7 @@ KITTI_RAW_DATA_BASEDIR = (
     "/Volumes/Expansion/KITTI_datasets/KITTI_Raw/raw_data_downloader"
 )
 DATE = "2011_09_26"
-drive = "0015"
+drive = "0009"
 pykitti_data = pykitti.raw(KITTI_RAW_DATA_BASEDIR, DATE, drive)
 
 
@@ -150,8 +196,8 @@ T_cam2img_velo = np.matmul(p_cam2, pykitti_data.calib.T_cam2_velo)
 ## Output - Visualized and segmented point cloud.
 
 
-text_prompt = "person.cars.street pole."
-for idx in range(0, 100, 10):
+text_prompt = "car. tree."
+for idx in range(0, 100):
     cam2_image_pil, cam3_image = pykitti_data.get_rgb(idx)
     lidar_points = pykitti_data.get_velo(idx)[:, :3]  ## Points in lidar frame
     print(pykitti_data.get_velo(idx).shape)
@@ -159,6 +205,16 @@ for idx in range(0, 100, 10):
         cam2_image_pil, lidar_points, text_prompt, T_cam2img_velo
     )
     cv2.imshow("window", image_with_boxes)
+    # plt.imshow(cv2.cvtColor(image_with_boxes, cv2.COLOR_BGR2RGB))
+    # plt.show()
+
+    # bev_img = point_cloud_2_birdseye(lidar_points)
+    # import matplotlib.pyplot as plt
+
+    # plt.imshow(bev_img, cmap="viridis", vmin=0, vmax=255)
+    # plt.show()
+    # cv2.imshow("BEV", bev_img)
+    # cv2.waitKey(0)
     # o3d.visualization.draw_geometries([pcd, *object_boxes])
     vis.create_window()
 
@@ -178,6 +234,9 @@ for idx in range(0, 100, 10):
     )  # p_cam2
     parameters.extrinsic = pykitti_data.calib.T_cam2_velo
     ctr.convert_from_pinhole_camera_parameters(parameters, True)
+
+    ctr.camera_local_translate(forward=0, right=0, up=3)
+    # ctr.camera_local_rotate(x=40, y=0)
 
     vis.poll_events()
     vis.update_renderer()
